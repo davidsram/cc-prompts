@@ -16,7 +16,7 @@ statusline 渲染后类似：
 - ctx 段用 `ctx:N% (M%)` 格式
 - 任何段没数据时直接消失，不留空位
 
-## 文件改动（3 处）
+## 文件改动（4 处）
 
 **新建** `~/.claude/statusline-plan.sh`（可执行，plan/balance 查询脚本）：
 - 接受 3 个位置参数：`$1=model $2=base_url $3=api_key`
@@ -42,6 +42,16 @@ statusline 渲染后类似：
 }
 ```
 > 教训：曾经把整条 shell 命令 inline 进 `statusLine.command` 字段——双层转义（JSON + shell）地狱、jq 的单引号要变 `'\\''`、改一次校验一次。脚本和配置解耦后，改 `statusline.sh` 不动 settings.json，调试也能直接 `bash -x ~/.claude/statusline.sh` 跑。
+
+**新建** `~/.claude/fix-statusline.sh`（可执行，防 `cc switch` 等外部工具覆写 `statusLine.command`，见末尾"防覆写机制"节）：
+- `cc switch`、`cc update` 等外部工具会**整体覆写** `~/.claude/settings.json`，把 `statusLine.command` 还原成旧 inline 版本
+- 该脚本幂等检测 `statusLine.command` 是否为正确路径，不是就修回去
+- 配合项目级 hook（`.claude/settings.local.json`）在每次 Bash 命令后自动触发修复
+
+**修改**（或新建）项目中 `.claude/settings.local.json`（**不**提交到 git），加 PostToolUse hook：
+- Matcher: `Bash`，在每次 Bash 命令执行后自动跑 `fix-statusline.sh`
+- 这个文件在项目目录下，`cc switch` 完全不碰它，hook 永不被擦除
+- 同时加 `.claude/settings.local.json` 到 `.gitignore`
 
 ## ctx 段计算方式
 
@@ -143,6 +153,10 @@ printf '%s\n' '{"message":{"usage":{"input_tokens":100,"cache_read_input_tokens"
 4. 修改 `~/.claude/settings.json` 的 `statusLine.command` 指向 `$HOME/.claude/statusline.sh`，`jq -e` 校验 JSON 合法
 5. Claude Code 重渲染 statusline（任意输入或工具调用会触发）—— 看到 `[dir] · model · 5h N% · wk N% · ctx:N% (M%)` 即成功
 6. 再加 kimi/zhipu/zenmux/deepseek 到 plan 脚本，每加一家跑一次合成 JSON 单测
+7. 配置防覆写（见"防覆写机制"节）：
+   - 写 `~/.claude/fix-statusline.sh`，`chmod +x`，模拟破坏后跑一次验证
+   - 写项目中 `.claude/settings.local.json`，加 `.gitignore`
+   - 跑一次 `!cc switch somemodel` 验证 hook 能自动修复
 
 ## 参考实现：`~/.claude/statusline.sh`
 
@@ -212,10 +226,83 @@ fi
 printf "\033[2m%s\033[0m" "$out"
 ```
 
+## 防覆写机制
+
+### 问题
+
+`cc switch`、`cc update` 等外部工具会整体覆写 `~/.claude/settings.json`，把精心配置的 `statusLine.command` 恢复成旧 inline 版本（读假字段 `.context_window.*`），导致 statusline 只剩暗色 `[dir]` "看起来像没显示"。
+
+### 方案
+
+双层防御：
+
+1. **`~/.claude/fix-statusline.sh`** — 幂等修复脚本，检测 `statusLine.command` 是否为正确路径，不是就 jq 修回去（只改 `statusLine` 字段，不碰 env/permissions 等）
+2. **项目 `.claude/settings.local.json`** — PostToolUse hook on Bash，每次 Bash 命令后自动触发修复。`cc switch` 不碰此文件，hook 永不被擦除
+
+### 触发链路
+
+```
+用户跑 !cc switch deepseek
+  → Bash 执行，cc switch 覆写 ~/.claude/settings.json（statusLine 被回退成坏的）
+  → PostToolUse hook on Bash 自动触发
+  → fix-statusline.sh 检测 statusLine.command 不对，修回正确路径
+  → 下次 statusline 刷新一切正常
+```
+
+### 参考实现：`~/.claude/fix-statusline.sh`
+
+```bash
+#!/bin/bash
+# fix-statusline.sh — ensures ~/.claude/settings.json has correct statusLine.command
+# Idempotent, silent on success. Called by PostToolUse hook after cc switch runs.
+
+set -u
+
+SELF="$HOME/.claude/statusline.sh"
+CFG="$HOME/.claude/settings.json"
+
+[ -f "$CFG" ] || exit 0
+
+# Check if already correct
+jq -e --arg cmd "$SELF" '.statusLine.command == $cmd' "$CFG" >/dev/null 2>&1 && exit 0
+
+# Fix it — merge, don't blast other fields
+tmp=$(mktemp /tmp/fix-statusline.XXXXXX)
+jq --arg cmd "$SELF" '.statusLine = {"type":"command","command":$cmd}' "$CFG" > "$tmp" 2>/dev/null && mv "$tmp" "$CFG" || rm -f "$tmp"
+```
+
+### 参考实现：项目 `.claude/settings.local.json`
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/fix-statusline.sh",
+            "timeout": 5,
+            "statusMessage": "Verifying statusline config..."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+务必加 `.gitignore`：
+```
+.claude/settings.local.json
+```
+
 ## 完成后检查
 
 - 真实 minimax key → 应该看到 `5h N% · wk N%`
 - 切到 deepseek 模型 → plan 段消失，余额格式正确（需要 deepseek 真 key）
+- 跑完 `!cc switch` 后 statusline 仍然正常 → 防覆写 hook 生效
 - 切到 claude-sonnet → plan 段消失
 - 长时间不动 statusline（>60s）→ API 调用频率不超过 1 次/60s/model
 
@@ -230,3 +317,4 @@ printf "\033[2m%s\033[0m" "$out"
 | 改 `statusLine.command` 后没生效 | settings 监视器只盯会话启动时已存在的 settings 文件目录 | `/hooks` 菜单走一遍触发重载，或重启 Claude Code |
 | `tac: command not found` | macOS 默认无 `tac`，statusline 子 shell 也不一定带 brew PATH | 用 `awk '/"usage"/{last=$0} END{print last}'` 替代 |
 | 切 model 后 plan 段瞎报数 | 缓存 key 没按 model 分粒度，A model 的缓存被 B model 用 | `safe_model=$(printf '%s' "$model" \| tr '[:upper:]' '[:lower:]' \| tr -c 'a-z0-9' '_')` 进 cache 文件名 |
+| 跑了 `cc switch` 后 statusline 只剩 `[dir]` | `cc switch` 整体覆写 `~/.claude/settings.json`，把 `statusLine.command` 回退了 | 配防覆写 hook（见"防覆写机制"节）；或跑一次 `fix-statusline.sh` 手动修复 |

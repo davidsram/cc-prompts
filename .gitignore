@@ -15,3 +15,6 @@
 # temp
 /tmp/
 *.tmp
+
+# personal config overrides
+.claude/settings.local.json
