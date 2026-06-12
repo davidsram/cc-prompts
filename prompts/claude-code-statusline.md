@@ -16,19 +16,61 @@ statusline 渲染后类似：
 - ctx 段用 `ctx:N% (M%)` 格式
 - 任何段没数据时直接消失，不留空位
 
-## 文件改动
+## 文件改动（3 处）
 
-**新建** `~/.claude/statusline-plan.sh`（可执行）：
+**新建** `~/.claude/statusline-plan.sh`（可执行，plan/balance 查询脚本）：
 - 接受 3 个位置参数：`$1=model $2=base_url $3=api_key`
 - 输出格式化的 plan/balance 字符串，或空（任何失败都静默退出 0）
 - 60 秒缓存到 `/tmp/.claude_statusline_plan_${model_safe}`，key 用 model 名（lowercase + 非字母数字字符替换为 `_`）
 - 2 秒 curl 超时
 
-**修改** `~/.claude/settings.json` 的 `statusLine.command` 字段：
-- 从 stdin 读 statusline JSON（`cat`），用 jq 提取 `.model.display_name // .model.id // empty`、`.context_window.used_percentage // empty`、`.context_window.remaining_percentage // empty`
+**新建** `~/.claude/statusline.sh`（可执行，渲染入口，见末尾"参考实现"可整段抄）：
+- 从 stdin 读 Claude Code 下发的 statusline JSON
+- 用 jq 抽 `.model.display_name // .model.id`、`.workspace.current_dir // .cwd`、`.transcript_path`
+- ctx 段**不能**直接从 JSON 拿——Claude Code 下发的 payload 不含 `context_window` 字段，必须自己算（见下"ctx 段计算方式"）
 - 调 `~/.claude/statusline-plan.sh "$model" "${ANTHROPIC_BASE_URL:-}" "${ANTHROPIC_AUTH_TOKEN:-}"` 拿 plan
-- 用变量 `sep=""` 跟踪分隔符，循环给每段加 `printf "%s%s" "$sep" "段内容"; sep=" · "`
+- 用变量 `sep=""` 跟踪分隔符，循环给每段加 `out="${out}${sep}<段>"; sep=" · "`
 - 全部包在 `\033[2m...\033[0m` 灰色 ANSI 里
+
+**修改** `~/.claude/settings.json`，让 `statusLine` 指向 wrapper 脚本（**不要 inline 命令**）：
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "$HOME/.claude/statusline.sh"
+  }
+}
+```
+> 教训：曾经把整条 shell 命令 inline 进 `statusLine.command` 字段——双层转义（JSON + shell）地狱、jq 的单引号要变 `'\\''`、改一次校验一次。脚本和配置解耦后，改 `statusline.sh` 不动 settings.json，调试也能直接 `bash -x ~/.claude/statusline.sh` 跑。
+
+## ctx 段计算方式
+
+Claude Code 真实 statusline payload 形如：
+```json
+{"session_id":"...","transcript_path":"/Users/.../<uuid>.jsonl","cwd":"...","workspace":{"current_dir":"...","project_dir":"..."},"model":{"id":"...","display_name":"..."},"cost":{...},"version":"...","output_style":{...},"exceeds_200k_tokens":false}
+```
+
+**没有 `context_window` 字段。** 早期文档照搬第三方示例写了这个字段，实测一律取不到，最终 statusline 只剩暗色目录名"看起来像没显示"。
+
+正确做法：从 `transcript_path` 指向的 JSONL 里取最后一条 `usage`，加总它的 input / cache 三件套：
+
+```bash
+maxctx=${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-200000}
+used_tok=$(awk '/"usage"/{last=$0} END{print last}' "$tpath" 2>/dev/null \
+  | jq -r '(.message.usage // .usage)
+           | (.input_tokens // 0)
+             + (.cache_read_input_tokens // 0)
+             + (.cache_creation_input_tokens // 0)' 2>/dev/null || echo 0)
+pct=$(awk -v u="$used_tok" -v m="$maxctx" 'BEGIN{if(m>0)printf "%.0f", u*100/m; else print 0}')
+rem=$((100 - pct))
+```
+
+要点：
+- `awk` 找最后一条含 `"usage"` 的 JSONL 行（macOS 默认无 `tac`，且 statusline 子 shell 不一定带 brew PATH）
+- `usage` 可能在 `.message.usage`（assistant turn）或顶层 `.usage`（compaction 摘要），都兼容
+- 加总 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`，否则跟 Claude Code 内部账本对不上（cache hit 占了大头）
+- 分母走 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 环境变量，没设就用 200000 兜底（1M 上下文用户应该已经在 settings.json 的 env 里设过这个值，statusline 子进程会继承）
+- `used_tok=0` 时不输出 ctx 段（新会话还没有 assistant turn，避免显示 `ctx:0% (100%)` 噪音）
 
 ## Provider 路由矩阵
 
@@ -65,7 +107,16 @@ statusline 渲染后类似：
 - 未知 model + 未知 base → plan 隐藏，model/ctx 还在
 - 缺 key → plan 隐藏
 
-`sample_json` 模板：`{"model":{"id":"MiniMax-M3","display_name":"MiniMax M3"},"context_window":{"used_percentage":42,"remaining_percentage":58}}`
+`sample_json` 模板（贴近真实 Claude Code statusline payload）：
+```json
+{"session_id":"abc","transcript_path":"/tmp/fake-transcript.jsonl","cwd":"/Users/me/proj","workspace":{"current_dir":"/Users/me/proj","project_dir":"/Users/me/proj"},"model":{"id":"MiniMax-M3","display_name":"MiniMax M3"},"version":"2.x","cost":{"total_cost_usd":0}}
+```
+
+为了让 ctx 段有值，端到端测试前先写一份假 transcript：
+```bash
+printf '%s\n' '{"message":{"usage":{"input_tokens":100,"cache_read_input_tokens":419000,"cache_creation_input_tokens":1500}}}' > /tmp/fake-transcript.jsonl
+```
+（这条对应 1M context 下 ~42% 用量）
 
 ## 行为约定
 
@@ -85,11 +136,81 @@ statusline 渲染后类似：
 
 ## 实施步骤
 
-1. 写 `~/.claude/statusline-plan.sh`，先只支持 minimax，验证能用真 key 跑通
-2. 跑 8 个端到端场景，全过再继续
-3. 加 kimi/zhipu/zenmux/deepseek 4 家，每加一家跑一次合成 JSON 单测
-4. 修改 `~/.claude/settings.json` 的 `statusLine.command`
-5. 重启 Claude Code 看实际渲染效果
+1. 写 `~/.claude/statusline-plan.sh`，先只支持 minimax，`chmod +x`，命令行验证：
+   `~/.claude/statusline-plan.sh "MiniMax M3" "$ANTHROPIC_BASE_URL" "$ANTHROPIC_AUTH_TOKEN"` 应输出 `5h N% · wk N%`
+2. 写 `~/.claude/statusline.sh`（可整段抄"参考实现"节），`chmod +x`
+3. 端到端验 `statusline.sh`：写假 transcript + 喂假 payload（见"测试"节第 2 部分）
+4. 修改 `~/.claude/settings.json` 的 `statusLine.command` 指向 `$HOME/.claude/statusline.sh`，`jq -e` 校验 JSON 合法
+5. Claude Code 重渲染 statusline（任意输入或工具调用会触发）—— 看到 `[dir] · model · 5h N% · wk N% · ctx:N% (M%)` 即成功
+6. 再加 kimi/zhipu/zenmux/deepseek 到 plan 脚本，每加一家跑一次合成 JSON 单测
+
+## 参考实现：`~/.claude/statusline.sh`
+
+整段可直接抄。已实战验证过 macOS（zsh 默认 shell、无 `tac`、statusline 子 shell 无 brew PATH 也能跑）：
+
+```bash
+#!/bin/bash
+# statusline.sh — renders the Claude Code statusline
+# Reads statusline JSON from stdin, outputs formatted statusline to stdout.
+#
+# Format: [dir] · model · plan/balance · ctx:used% (remaining%)
+# Segments auto-hide when data is missing. Separator " · " tracks via $sep.
+
+set -u
+
+input=$(cat)
+model=$(echo "$input" | jq -r '(.model.display_name // .model.id // empty)' 2>/dev/null)
+tpath=$(echo "$input" | jq -r '(.transcript_path // empty)' 2>/dev/null)
+cwd=$(echo "$input" | jq -r '(.workspace.current_dir // .cwd // empty)' 2>/dev/null)
+if [ -n "$cwd" ]; then
+  dir=$(basename "$cwd")
+else
+  dir=$(basename "$(pwd)")
+fi
+
+plan=$($HOME/.claude/statusline-plan.sh "$model" "${ANTHROPIC_BASE_URL:-}" "${ANTHROPIC_AUTH_TOKEN:-}" 2>/dev/null)
+
+# ctx: compute from transcript_path — Claude Code's statusline JSON does NOT
+# carry context_window fields, so we read the last "usage" line from the
+# transcript JSONL and sum input + cache_read + cache_creation tokens.
+maxctx=${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-200000}
+used_tok=0
+if [ -n "$tpath" ] && [ -f "$tpath" ]; then
+  used_tok=$(awk '/"usage"/{last=$0} END{print last}' "$tpath" 2>/dev/null \
+    | jq -r '(.message.usage // .usage)
+             | (.input_tokens // 0)
+               + (.cache_read_input_tokens // 0)
+               + (.cache_creation_input_tokens // 0)' 2>/dev/null)
+  case "$used_tok" in ''|*[!0-9]*) used_tok=0 ;; esac
+fi
+
+sep=""
+out=""
+
+# [dir]
+out="${out}${sep}[${dir}]"
+sep=" · "
+
+# model
+case "$model" in ""|null) ;; *)
+  out="${out}${sep}${model}"
+  ;;
+esac
+
+# plan/balance (from statusline-plan.sh)
+if [ -n "$plan" ]; then
+  out="${out}${sep}${plan}"
+fi
+
+# ctx:used% (remaining%)
+if [ "$used_tok" -gt 0 ] && [ "$maxctx" -gt 0 ]; then
+  pct=$(awk -v u="$used_tok" -v m="$maxctx" 'BEGIN{printf "%.0f", u*100/m}')
+  rem=$((100 - pct))
+  out="${out}${sep}ctx:${pct}% (${rem}%)"
+fi
+
+printf "\033[2m%s\033[0m" "$out"
+```
 
 ## 完成后检查
 
@@ -97,3 +218,15 @@ statusline 渲染后类似：
 - 切到 deepseek 模型 → plan 段消失，余额格式正确（需要 deepseek 真 key）
 - 切到 claude-sonnet → plan 段消失
 - 长时间不动 statusline（>60s）→ API 调用频率不超过 1 次/60s/model
+
+## 排错
+
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 整条 statusline 完全看不到 / 只剩暗色 `[dir]` | 读了不存在的字段（如 `.context_window.used_percentage`），所有段都是空字符串 | 重读"ctx 段计算方式"——Claude Code 真实 payload 形状以验证字段路径存在 |
+| `ctx:0% (100%)` 一直显示 | 新会话还没有 assistant turn，transcript 里没 `"usage"` 行；或 transcript 路径错 | 加 `[ "$used_tok" -gt 0 ]` 守卫；`ls -la "$tpath"` 验证路径 |
+| ctx% 比 Claude Code 内部账本小很多 | 只加了 `input_tokens`，漏了 `cache_read_input_tokens` 和 `cache_creation_input_tokens`（cache hit 占大头） | 三件套必须全加 |
+| plan 段不显示但 `~/.claude/statusline-plan.sh ...` 命令行能跑 | statusline 子 shell 没继承 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` | 验证 `~/.claude/settings.json` 的 `env` 块里有这俩值 |
+| 改 `statusLine.command` 后没生效 | settings 监视器只盯会话启动时已存在的 settings 文件目录 | `/hooks` 菜单走一遍触发重载，或重启 Claude Code |
+| `tac: command not found` | macOS 默认无 `tac`，statusline 子 shell 也不一定带 brew PATH | 用 `awk '/"usage"/{last=$0} END{print last}'` 替代 |
+| 切 model 后 plan 段瞎报数 | 缓存 key 没按 model 分粒度，A model 的缓存被 B model 用 | `safe_model=$(printf '%s' "$model" \| tr '[:upper:]' '[:lower:]' \| tr -c 'a-z0-9' '_')` 进 cache 文件名 |
