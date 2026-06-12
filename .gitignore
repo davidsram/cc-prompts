@@ -1,0 +1,17 @@
+# env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# temp
+/tmp/
+*.tmp
