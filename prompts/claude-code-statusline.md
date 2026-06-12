@@ -88,7 +88,7 @@ rem=$((100 - pct))
 
 | 触发 model 关键字 | provider | endpoint | 鉴权 | 关键字段 | 重要陷阱 |
 |---|---|---|---|---|---|
-| `minimax` / `abab` | MiniMax | `{host}/v1/api/openplatform/coding_plan/remains` | `Authorization: Bearer $key` | `model_remains[model_name=general].{current_interval_status, current_interval_remaining_percent, current_weekly_status, current_weekly_remaining_percent}` | host 默认 `https://api.minimaxi.com`（gateway 也直连，不被 base_url 绑架）；字段是**扁平**的（status 和 remain 平级），不是嵌套对象；**只显示 status==1 的窗口** |
+| `minimax` / `abab` | MiniMax | `{host}/v1/api/openplatform/coding_plan/remains` | `Authorization: Bearer $key` | `model_remains[model_name=general].{current_interval_status, current_interval_remaining_percent, current_weekly_status, current_weekly_remaining_percent}` | host 默认 `https://api.minimaxi.com`（gateway 也直连，不被 base_url 绑架）；字段是**扁平**的（status 和 remain 平级），不是嵌套对象；cc-switch 模式下也直连官方 host、字段路径与原生模式一致（仅 host 可能在 `api.minimaxi.com` CN / `api.minimax.io` EN 间切换）；**只显示 status==1 的窗口** |
 | `kimi` / `moonshot` | Kimi | `https://api.kimi.com/coding/v1/usages` | `Authorization: Bearer $key` | `limits[0].detail.{limit,remaining}`（5h）、`usage.{limit,remaining}`（wk） | 给的是 utilization（已用%），要 `100 - (1-remaining/limit)*100` 反转 |
 | `glm` | 智谱 GLM | `{host}/api/monitor/usage/quota/limit` | **`Authorization: $key` 无 Bearer 前缀** | `data.limits[].{unit,percentage,type}` | unit 3=5h、6=wk；filter `type=="TOKENS_LIMIT"`；utilization 反转；`success==false` 视为空 |
 | base URL 含 `zenmux` | ZenMux | `{base_url}` | `Authorization: Bearer $key` | `data.quota_5_hour.usage_percentage`、`data.quota_7_day.usage_percentage` | **唯一按 base URL 路由**（ZenMux 是代理，model 任意）；`usage_percentage` 是 0-1 分数不是 0-100；反转公式 `(1-frac)*100`；`success!=true` 视为空 |
