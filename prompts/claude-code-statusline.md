@@ -22,7 +22,7 @@ statusline 渲染后类似：
 - 接受 3 个位置参数：`$1=model $2=base_url $3=api_key`
 - 输出格式化的 plan/balance 字符串，或空（任何失败都静默退出 0）
 - 60 秒缓存到 `/tmp/.claude_statusline_plan_${model_safe}`，key 用 model 名（lowercase + 非字母数字字符替换为 `_`）
-- 2 秒 curl 超时
+- 5 秒 curl 超时（实测 api.minimaxi.com TTFB ≈3s，2s 一打就空，5s 稳；statusline 渲染大多命中 60s 缓存，慢的只发生在每 60s 一次的刷新窗口）
 
 **新建** `~/.claude/statusline.sh`（可执行，渲染入口，见末尾"参考实现"可整段抄）：
 - 从 stdin 读 Claude Code 下发的 statusline JSON
@@ -131,6 +131,7 @@ printf '%s\n' '{"message":{"usage":{"input_tokens":100,"cache_read_input_tokens"
 ## 行为约定
 
 - **静默失败**：任何错误（curl 失败、JSON 解析失败、jq 报错、auth 失败、响应里没数据）→ 脚本 exit 0 不输出。不允许把错误消息透到 statusline（终端一闪一闪很丑）。
+- **stale cache 兜底**：fetch 失败（curl 超时 / 空响应 / 解析失败）时若缓存文件存在就 cat 它的旧值，而不是输出空。比"宁可没有也别给旧数"更符合 statusline 使用场景——用户宁愿看到 30s 前的数也不愿看到段消失。缺 key 时同样走这个兜底。
 - **缓存粒度按 model**：用户切换 model 时不同 provider 的缓存互不污染。`safe_model` 用 `printf '%s' "$model" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_'` 生成。
 - **不在 60s TTL 内反复打 API**：用 `[ -f "$CACHE" ]` + `stat -f %m`（macOS）/ `stat -c %Y`（Linux）检查 mtime。
 - **不要在脚本里写 set -e**：静默失败需要 set -u 即可，加 -e 会让所有 error 暴露。
@@ -314,6 +315,7 @@ jq --arg cmd "$SELF" '.statusLine = {"type":"command","command":$cmd}' "$CFG" > 
 | `ctx:0% (100%)` 一直显示 | 新会话还没有 assistant turn，transcript 里没 `"usage"` 行；或 transcript 路径错 | 加 `[ "$used_tok" -gt 0 ]` 守卫；`ls -la "$tpath"` 验证路径 |
 | ctx% 比 Claude Code 内部账本小很多 | 只加了 `input_tokens`，漏了 `cache_read_input_tokens` 和 `cache_creation_input_tokens`（cache hit 占大头） | 三件套必须全加 |
 | plan 段不显示但 `~/.claude/statusline-plan.sh ...` 命令行能跑 | statusline 子 shell 没继承 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` | 验证 `~/.claude/settings.json` 的 `env` 块里有这俩值 |
+| plan 段**偶尔**不显示（命令行单跑稳定） | curl `--max-time 2` 太紧，真实 provider TTFB 经常 2-3s | 改 5s（实测 api.minimaxi.com TTFB ≈2.95s）；加 stale cache fallback，fetch 失败时 cat 旧值 |
 | 改 `statusLine.command` 后没生效 | settings 监视器只盯会话启动时已存在的 settings 文件目录 | `/hooks` 菜单走一遍触发重载，或重启 Claude Code |
 | `tac: command not found` | macOS 默认无 `tac`，statusline 子 shell 也不一定带 brew PATH | 用 `awk '/"usage"/{last=$0} END{print last}'` 替代 |
 | 切 model 后 plan 段瞎报数 | 缓存 key 没按 model 分粒度，A model 的缓存被 B model 用 | `safe_model=$(printf '%s' "$model" \| tr '[:upper:]' '[:lower:]' \| tr -c 'a-z0-9' '_')` 进 cache 文件名 |
