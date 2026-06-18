@@ -299,6 +299,63 @@ jq --arg cmd "$SELF" '.statusLine = {"type":"command","command":$cmd}' "$CFG" > 
 .claude/settings.local.json
 ```
 
+## 防覆写机制 V2：用户级 SessionStart hook（2026-06 实测发现）
+
+V1 的项目级 PostToolUse hook on Bash 看似合理（"cc switch 不碰 `.claude/settings.local.json`"），但实测有**两个根本缺陷**：
+
+1. **cc-switch 是 Tauri 桌面 app**（`~/.cc-switch/cc-switch.db` + 直接覆写 `~/.claude/settings.json`），**不走 Claude Code 的 Bash 工具**——用户在 cc-switch GUI 里点一下切换，PostToolUse hook 永远不会触发
+2. **项目级 `.claude/settings.local.json` 只在该项目目录下加载**——用户切到别的项目或在 `~` 起 Claude Code，hook 不生效
+
+### 症状
+`fix-statusline.sh` 写好了、`chmod +x` 了，但 `~/.claude/settings.json` 里 `hooks` 字段一直是空的。每次启动 Claude Code 都看到 statusline 坏掉，得手动跑 `bash ~/.claude/fix-statusline.sh` 才能修。
+
+### 修复
+把 hook 挂到**用户级** `~/.claude/settings.json`，事件用 **SessionStart**（每次 Claude Code 启动无条件触发，**不依赖** Bash 工具调用、不依赖项目上下文）：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/Users/yzc/.claude/statusline.sh"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/yzc/.claude/fix-statusline.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`fix-statusline.sh` 本身**不变**——V1 那份幂等脚本直接复用。
+
+### 为什么 SessionStart（用户级） > PostToolUse（项目级）
+
+| 维度 | V1 PostToolUse(Bash) 项目级 | V2 SessionStart 用户级 |
+|---|---|---|
+| cc-switch **GUI** 切换 provider | ❌ 不触发（Bash 工具未被调） | ✅ 下次启动自动修 |
+| cc-switch **CLI**（`!cc switch`） | ✅ 触发 | ✅ 下次启动自动修 |
+| 跨项目生效 | ❌ 仅当前项目 | ✅ 全部项目 |
+| cc-switch 未来加新覆写动作 | ⚠️ 取决于是否走 Bash | ✅ 无关，SessionStart 都跑 |
+| 性能开销 | 每次 Bash 调用都跑 | 仅启动时一次（幂等，无坏情况下 <10ms） |
+
+### 触发链路（V2）
+
+```
+用户点 cc-switch GUI 切换 provider
+  → cc-switch 直接覆写 ~/.claude/settings.json（statusLine 被回退成坏的 inline jq）
+  → 用户下次打开 Claude Code
+  → SessionStart hook 触发
+  → fix-statusline.sh 检测 statusLine.command 不对，修回正确路径
+  → 看到正确 statusline ✅
+```
+
 ## 完成后检查
 
 - 真实 minimax key → 应该看到 `5h N% · wk N%`
@@ -320,3 +377,4 @@ jq --arg cmd "$SELF" '.statusLine = {"type":"command","command":$cmd}' "$CFG" > 
 | `tac: command not found` | macOS 默认无 `tac`，statusline 子 shell 也不一定带 brew PATH | 用 `awk '/"usage"/{last=$0} END{print last}'` 替代 |
 | 切 model 后 plan 段瞎报数 | 缓存 key 没按 model 分粒度，A model 的缓存被 B model 用 | `safe_model=$(printf '%s' "$model" \| tr '[:upper:]' '[:lower:]' \| tr -c 'a-z0-9' '_')` 进 cache 文件名 |
 | 跑了 `cc switch` 后 statusline 只剩 `[dir]` | `cc switch` 整体覆写 `~/.claude/settings.json`，把 `statusLine.command` 回退了 | 配防覆写 hook（见"防覆写机制"节）；或跑一次 `fix-statusline.sh` 手动修复 |
+| 每次启动 Claude Code 都要手动跑 `fix-statusline.sh` 才修好 | hook 没接到 settings.json；或挂了 V1 项目级 PostToolUse 但 cc-switch GUI 切 provider 不走 Bash 工具 | 升级到 V2：把 SessionStart hook 挂到**用户级** `~/.claude/settings.json`（不是项目级），见"防覆写机制 V2"节 |
