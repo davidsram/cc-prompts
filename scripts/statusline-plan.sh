@@ -19,15 +19,15 @@ MODEL=${1:-}
 BASE_URL=${2:-}
 API_KEY=${3:-}
 
-[ -z "$API_KEY" ] && exit 0
-[ -z "$MODEL" ] && exit 0
-
 mlc=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]')
 
-TIMEOUT=2
+TIMEOUT=5
 safe_model=$(printf '%s' "$mlc" | tr -c 'a-z0-9' '_')
 CACHE="/tmp/.claude_statusline_plan_${safe_model}"
 TTL=60
+
+[ -z "$API_KEY" ] && { [ -f "$CACHE" ] && cat "$CACHE"; exit 0; }
+[ -z "$MODEL" ] && exit 0
 
 # Cache check
 now=$(date +%s)
@@ -182,7 +182,7 @@ if [ -z "$out" ]; then
   esac
 fi
 
-[ -z "$out" ] && exit 0
+[ -z "$out" ] && { [ -f "$CACHE" ] && cat "$CACHE"; exit 0; }
 
 printf '%s' "$out" > "$CACHE"
 printf '%s' "$out"
